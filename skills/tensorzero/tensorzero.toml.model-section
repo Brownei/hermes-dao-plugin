@@ -1,0 +1,26 @@
+# ─── Models ───────────────────────────────────────────────────────────
+
+[models.glm_5_1]
+routing = ["venice"]
+
+[models.glm_5_1.providers.venice]
+type = "openai"
+api_base = "https://api.venice.ai/api/v1"
+model_name = "zai-org-glm-5-1"
+api_key_location = "env::VENICE_API_KEY"
+
+# Hermes 3 model — bidirectional fallback between Venice and Akash
+[models.hermes_3_405b]
+routing = ["venice", "akash_h100"]
+
+[models.hermes_3_405b.providers.venice]
+type = "openai"
+api_base = "https://api.venice.ai/api/v1"
+model_name = "hermes-3-llama-3.1-405b"
+api_key_location = "env::VENICE_API_KEY"
+
+# Akash H100 endpoint (Hermes 3, no API key needed)
+[models.hermes_3_405b.providers.akash_h100]
+type = "openai"
+api_base = "https://kik6b27vph8jjca4fide9jtmss.ingress.h100.wdc.hh.akash.pub/v1"
+model_name = "hermes-3-llama-3.1-405b"

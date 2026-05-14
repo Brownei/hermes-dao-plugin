@@ -1,0 +1,91 @@
+# TensorZero Gateway Configuration
+# Hermes Agent <-> TensorZero <-> Akash H100 (primary inference endpoint)
+#
+# Architecture:
+#   Hermes Agent (OpenAI client) -> localhost:3000 -> Akash H100 OpenAPI
+#
+# Note: Venice is no longer in use. This gateway serves as a
+# direct proxy to the Akash-hosted models.
+
+# ─── Models ───────────────────────────────────────────────────────────
+
+[models.akash_h100]
+routing = ["akash"]
+
+[models.akash_h100.providers.akash]
+type = "openai"
+api_base = "https://coppka0dbpel1flq8m4mh9auko.ingress.h100.wdc.hh.akash.pub/v1"
+model_name = "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled"
+api_key_location = "none"
+
+# ─── Functions: O-Line Resource Management ─────────────────────────────
+
+# General-purpose chat passthrough (default Hermes interaction)
+[functions.oline_chat]
+type = "chat"
+
+[functions.oline_chat.variants.akash_default]
+type = "chat_completion"
+model = "akash_h100"
+
+# RPC endpoint provisioning (testnet + mainnet)
+[functions.rpc_provision]
+type = "chat"
+
+[functions.rpc_provision.variants.akash_default]
+type = "chat_completion"
+model = "akash_h100"
+templates.system.path = "templates/rpc_provision_system.minijinja"
+
+# Indexer management (Tendermint index, block explorer)
+[functions.indexer_manage]
+type = "chat"
+
+[functions.indexer_manage.variants.akash_default]
+type = "chat_completion"
+model = "akash_h100"
+templates.system.path = "templates/indexer_manage_system.minijinja"
+
+# Relayer management (IBC cross-chain)
+[functions.relayer_manage]
+type = "chat"
+
+[functions.relayer_manage.variants.akash_default]
+type = "chat_completion"
+model = "akash_h100"
+templates.system.path = "templates/relayer_manage_system.minijinja"
+
+# Node bootstrap and management
+[functions.node_bootstrap]
+type = "chat"
+
+[functions.node_bootstrap.variants.akash_default]
+type = "chat_completion"
+model = "akash_h100"
+templates.system.path = "templates/node_bootstrap_system.minijinja"
+
+# Tool selection routing (Hermes agent picks tools)
+[functions.tool_selection]
+type = "chat"
+
+[functions.tool_selection.variants.akash_default]
+type = "chat_completion"
+model = "akash_h100"
+templates.system.path = "templates/tool_selection_system.minijinja"
+
+# ─── Metrics for Feedback Loop ────────────────────────────────────────
+
+[metrics.task_success]
+type = "boolean"
+level = "inference"
+optimize = "max"
+
+[metrics.response_latency]
+type = "float"
+level = "inference"
+optimize = "min"
+
+[metrics.infrastructure_uptime]
+type = "float"
+level = "episode"
+optimize = "max"
