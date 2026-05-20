@@ -1,0 +1,13 @@
+{
+  "name": "terp-kanban",
+  "label": "Terp Kanban",
+  "description": "Wallet-protected Kanban board — connect your Cosmos wallet (Keplr/Leap/Cosmostation) to create boards, share with others, and manage team access",
+  "icon": "Wallet",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/terp-kanban",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
