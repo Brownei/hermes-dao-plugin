@@ -585,6 +585,8 @@ def create_board(
     color: Optional[str] = None,
     columns: Optional[list[dict]] = None,
     created_by_wallet: Optional[str] = None,
+    author_name: Optional[str] = None,
+    chain_id: Optional[str] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -593,7 +595,8 @@ def create_board(
     board already exists — matching ``mkdir -p`` semantics.
 
     When ``created_by_wallet`` is provided, the wallet address is inserted
-    as an admin member of the board.
+    as an admin member of the board. The admin's author_name and chain_id
+    are stored to identify the creator.
     """
     normed = _normalize_board_slug(slug)
     if not normed:
@@ -613,7 +616,8 @@ def create_board(
     if created_by_wallet:
         conn = connect(board=normed)
         try:
-            add_board_member(conn, normed, created_by_wallet, role="admin")
+            add_board_member(conn, normed, created_by_wallet, role="admin",
+                           author_name=author_name, chain_id=chain_id)
         finally:
             conn.close()
     return meta
@@ -731,21 +735,33 @@ def add_board_member(
     board_slug: str,
     wallet_addr: str,
     role: str = "viewer",
+    author_name: Optional[str] = None,
+    chain_id: Optional[str] = None,
 ) -> bool:
     """Add a wallet address as a member of a board.
 
     Returns True if the member was added or updated, False if the role
     is invalid. Idempotent — re-adding an existing member updates their role.
+    When role is 'admin', author_name and chain_id are stored to identify the creator.
     """
     if role not in _VALID_ROLES:
         return False
+    now = int(time.time())
     with write_txn(conn):
-        conn.execute(
-            "INSERT INTO board_members (board_slug, wallet_addr, role, joined_at) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(board_slug, wallet_addr) DO UPDATE SET role = excluded.role",
-            (board_slug, wallet_addr, role, int(time.time())),
-        )
+        if role == "admin":
+            conn.execute(
+                "INSERT INTO board_members (board_slug, wallet_addr, role, author_name, chain_id, joined_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(board_slug, wallet_addr) DO UPDATE SET role = excluded.role, author_name = excluded.author_name, chain_id = excluded.chain_id",
+                (board_slug, wallet_addr, role, author_name, chain_id, now),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO board_members (board_slug, wallet_addr, role, joined_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(board_slug, wallet_addr) DO UPDATE SET role = excluded.role",
+                (board_slug, wallet_addr, role, now),
+            )
     return True
 
 
@@ -814,6 +830,25 @@ def check_board_permission(
 def is_board_admin(conn: sqlite3.Connection, board_slug: str, wallet_addr: str) -> bool:
     """Check if a wallet address is an admin of a board."""
     return get_member_role(conn, board_slug, wallet_addr) == "admin"
+
+
+def get_board_creator(conn: sqlite3.Connection, board_slug: str) -> Optional[dict]:
+    """Return the admin (creator) of a board with wallet_addr, author_name, and chain_id.
+
+    Returns None if no admin exists for the board.
+    """
+    row = conn.execute(
+        "SELECT wallet_addr, author_name, chain_id "
+        "FROM board_members WHERE board_slug = ? AND role = 'admin'",
+        (board_slug,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "wallet_addr": row["wallet_addr"],
+        "author_name": row["author_name"],
+        "chain_id": row["chain_id"],
+    }
 
 
 def get_boards_for_wallet(wallet_addr: str) -> list[dict]:
@@ -888,6 +923,175 @@ class Share:
             "use_count": self.use_count,
             "is_revoked": bool(self.is_revoked),
         }
+
+
+def create_board_share(
+    board_slug: str,
+    owner_address: str,
+    role: str,
+    expires_at: int,
+    share_id: str,
+) -> Share:
+    """Create a new share link for a board.
+
+    Returns the Share object. Raises ValueError if role is invalid.
+    """
+    if role not in ("viewer", "editor"):
+        raise ValueError(f"Invalid role: {role}. Must be 'viewer' or 'editor'.")
+
+    conn = connect(board=board_slug)
+    try:
+        now = int(time.time())
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO board_shares "
+                "(id, board_slug, owner_address, role, expires_at, created_at, use_count, is_revoked) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+                (share_id, board_slug, owner_address, role, expires_at, now),
+            )
+        return Share(
+            id=share_id,
+            board_slug=board_slug,
+            owner_address=owner_address,
+            role=role,
+            expires_at=expires_at,
+            created_at=now,
+        )
+    finally:
+        conn.close()
+
+
+def list_board_shares(board_slug: str) -> list[Share]:
+    """Return all non-revoked share links for a board."""
+    conn = connect(board=board_slug)
+    try:
+        rows = conn.execute(
+            "SELECT id, board_slug, owner_address, role, expires_at, "
+            "created_at, last_used_at, use_count, is_revoked "
+            "FROM board_shares WHERE board_slug = ? ORDER BY created_at DESC",
+            (board_slug,),
+        ).fetchall()
+        return [
+            Share(
+                id=r["id"],
+                board_slug=r["board_slug"],
+                owner_address=r["owner_address"],
+                role=r["role"],
+                expires_at=r["expires_at"],
+                created_at=r["created_at"],
+                last_used_at=r["last_used_at"],
+                use_count=r["use_count"],
+                is_revoked=r["is_revoked"],
+            )
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def get_board_share(share_id: str) -> Optional[Share]:
+    """Get a share by its ID (JWT token). Returns None if not found."""
+    # We don't know the board_slug, so we search across all boards.
+    from hermes_constants import get_hermes_home
+    boards_dir = get_hermes_home() / "kanban" / "boards"
+    if not boards_dir.is_dir():
+        return None
+
+    for child in sorted(boards_dir.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or not (child / "kanban.db").exists():
+            continue
+        slug = child.name
+        try:
+            normed = _normalize_board_slug(slug)
+        except ValueError:
+            continue
+        if not normed:
+            continue
+        conn = connect(board=normed)
+        try:
+            row = conn.execute(
+                "SELECT id, board_slug, owner_address, role, expires_at, "
+                "created_at, last_used_at, use_count, is_revoked "
+                "FROM board_shares WHERE id = ?",
+                (share_id,),
+            ).fetchone()
+            if row:
+                return Share(
+                    id=row["id"],
+                    board_slug=row["board_slug"],
+                    owner_address=row["owner_address"],
+                    role=row["role"],
+                    expires_at=row["expires_at"],
+                    created_at=row["created_at"],
+                    last_used_at=row["last_used_at"],
+                    use_count=row["use_count"],
+                    is_revoked=row["is_revoked"],
+                )
+        finally:
+            conn.close()
+    return None
+
+
+def revoke_board_share(share_id: str) -> bool:
+    """Revoke a share link. Returns True if found and revoked."""
+    from hermes_constants import get_hermes_home
+    boards_dir = get_hermes_home() / "kanban" / "boards"
+    if not boards_dir.is_dir():
+        return False
+
+    for child in sorted(boards_dir.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or not (child / "kanban.db").exists():
+            continue
+        slug = child.name
+        try:
+            normed = _normalize_board_slug(slug)
+        except ValueError:
+            continue
+        if not normed:
+            continue
+        conn = connect(board=normed)
+        try:
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE board_shares SET is_revoked = 1 WHERE id = ?",
+                    (share_id,),
+                )
+            if cur.rowcount > 0:
+                return True
+        finally:
+            conn.close()
+    return False
+
+
+def validate_share_token(share_id: str) -> Optional[Share]:
+    """Validate a share token: check existence, not revoked, not expired.
+
+    Increments use_count and updates last_used_at on success.
+    Returns the Share object, or None if invalid/expired/revoked.
+    """
+    share = get_board_share(share_id)
+    if share is None:
+        return None
+    if share.is_revoked:
+        return None
+    if share.expires_at < int(time.time()):
+        return None
+
+    # Update use stats
+    conn = connect(board=share.board_slug)
+    try:
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE board_shares SET use_count = use_count + 1, last_used_at = ? WHERE id = ?",
+                (int(time.time()), share_id),
+            )
+    finally:
+        conn.close()
+
+    share.use_count += 1
+    share.last_used_at = int(time.time())
+    return share
+
 
 # ---------------------------------------------------------------------------
 # Board columns (custom columns per board)
@@ -1366,10 +1570,13 @@ CREATE INDEX IF NOT EXISTS idx_board_columns_slug    ON board_columns(board_slug
 -- Wallet-based board membership. Each board has members with roles
 -- (admin, editor, viewer). The board creator is always an admin.
 -- Admins can add/remove members and change roles (editor/viewer only).
+-- author_name and chain_id store the admin's identity (required for creator).
 CREATE TABLE IF NOT EXISTS board_members (
     board_slug  TEXT NOT NULL,
     wallet_addr TEXT NOT NULL,
     role        TEXT NOT NULL DEFAULT 'viewer',
+    author_name TEXT,
+    chain_id    TEXT,
     joined_at   INTEGER NOT NULL,
     PRIMARY KEY (board_slug, wallet_addr)
 );
